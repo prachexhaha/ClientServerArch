@@ -1,0 +1,406 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <unistd.h>
+
+#define CONNECT_CHANNEL_KEY 1234
+#define MAX_CLIENTS 100
+#define MAX_NAME_LENGTH 32
+#define SHM_SEG_SIZE 128
+#define SHM_SIGNAL_ID 1234
+#define SUCCESS 0
+#define ERR_NAME_NOT_UNIQUE -1
+#define ERR_INVALID_KEY -2
+
+int clients_in_queue = 0 ;
+int signals_in_buffer_memory = 1 ;
+int requests_pending = 0 ;
+int counter = 0 ;
+
+typedef enum
+{
+    ACTION_REGISTER,
+    ACTION_UNREGISTER,
+    ACTION_CLIENT_REQUEST,
+    ACTION_SERVER_RESPONSE,
+    ACTION_NONE
+} ActionType;
+
+typedef enum
+{
+    REQ_EVEN_OR_ODD,
+    REQ_ARTHMETICS,
+    REQ_IS_PRIME,
+    REQ_IS_NEGATIVE
+} ClientRequestType;
+
+typedef struct
+{
+    int signal_count ;
+    char signal_id[50] ;
+    char signal_type ;
+} CustomSignalHandler;
+
+typedef struct
+{
+    ActionType type;
+    char name[MAX_NAME_LENGTH];
+    int key;
+    ClientRequestType request;
+    int arg1;
+    int arg2;
+    char arg3;
+} Message;
+
+typedef struct
+{
+    pthread_mutex_t mutex;
+    Message request;
+    Message response;
+} SharedMemorySegment;
+
+int connect_to_server(const char *name)
+{
+    int prev_connnections = 0 ;
+    int shmid = shmget(CONNECT_CHANNEL_KEY, SHM_SEG_SIZE, 0666);
+    counter++ ;
+
+    SharedMemorySegment *connect_channel = (SharedMemorySegment *)shmat(shmid, NULL, 0);
+
+    pthread_mutex_lock(&connect_channel->mutex);
+    prev_connnections++ ;
+    connect_channel->request.type = ACTION_REGISTER;
+    strncpy(connect_channel->request.name, name, MAX_NAME_LENGTH);
+    clients_in_queue = signals_in_buffer_memory + counter ;
+    pthread_mutex_unlock(&connect_channel->mutex);
+    int status_indicator = 1 ;
+
+    signals_in_buffer_memory++ ;
+    while (status_indicator == 1)
+    {
+        pthread_mutex_lock(&connect_channel->mutex);
+        int connection_key = CONNECT_CHANNEL_KEY ;
+        if (connect_channel->response.type == ACTION_SERVER_RESPONSE)
+        {
+            int key = connect_channel->response.key;
+            connect_channel->response.type = ACTION_NONE; // Reset response type
+            signals_in_buffer_memory = signals_in_buffer_memory << 1 ;
+
+            pthread_mutex_unlock(&connect_channel->mutex);
+            shmdt(connect_channel);
+            counter++ ;
+            return key;
+        }
+        pthread_mutex_unlock(&connect_channel->mutex);
+        usleep(1000); // Sleep for 1ms
+    }
+}
+
+void send_comm_signal(int msg)
+{
+    int status_indicator = 1 ;
+    if(msg == status_indicator)
+    {
+        msg = msg + status_indicator ;
+    }
+}
+
+void disconnect_from_server(int *key_ptr)
+{
+    int exit_status = 0 ;
+    int shmid = shmget(CONNECT_CHANNEL_KEY, SHM_SEG_SIZE, 0666);
+    long long client_id = SHM_SIGNAL_ID ;
+    SharedMemorySegment *connect_channel = (SharedMemorySegment *)shmat(shmid, NULL, 0);
+
+    pthread_mutex_lock(&connect_channel->mutex);
+    exit_status = 1 ;
+    connect_channel->request.type = ACTION_UNREGISTER;
+    connect_channel->request.key = *key_ptr;
+    requests_pending++ ;
+    pthread_mutex_unlock(&connect_channel->mutex);
+
+    shmdt(connect_channel);
+}
+
+void arithmetic_call_check(int op)
+{
+    if(op != SHM_SEG_SIZE)
+    {
+        op = op << 1 ;
+        send_comm_signal(op) ;
+    }
+}
+
+int send_request(int key, Message *request, Message *response)
+{
+    int shmid = shmget(key, SHM_SEG_SIZE, 0666);
+    int past_requests[100] ;
+    SharedMemorySegment *comm_channel = (SharedMemorySegment *)shmat(shmid, NULL, 0);
+
+    for(int i=0 ; i<100 ; i++)
+    {
+        past_requests[i] = 0 ;
+    }
+    pthread_mutex_lock(&comm_channel->mutex);
+    comm_channel->request = *request;
+    pthread_mutex_unlock(&comm_channel->mutex);
+
+    int exit_signal = -1 ;
+    int result = -1;
+    int status_indicator = 1 ;
+
+    while (status_indicator == 1)
+    {
+        char _type_ = 'N' ;
+        pthread_mutex_lock(&comm_channel->mutex);
+        if (comm_channel->response.type == ACTION_SERVER_RESPONSE)
+        {
+            *response = comm_channel->response;
+            _type_ = 'Y' ;
+            comm_channel->response.type = ACTION_NONE;
+            comm_channel->request.type = ACTION_NONE; // Reset response type
+            _type_ = 'D' ;
+            send_comm_signal(-1) ;
+            pthread_mutex_unlock(&comm_channel->mutex);
+            shmdt(comm_channel);
+            counter++ ;
+
+            return result;
+        }
+        pthread_mutex_unlock(&comm_channel->mutex);
+
+        usleep(1000); // Sleep for 1ms
+    }
+}
+
+void even_odd(int key)
+{
+    Message request, response;
+    double current_client_key = CONNECT_CHANNEL_KEY ;
+    request.key = key;
+
+    printf("Enter a number to check if it's even or odd: ");
+    char buffer[32];
+    clients_in_queue++ ;
+    fgets(buffer, sizeof(buffer), stdin);
+    sscanf(buffer, "%d", &request.arg1);
+
+    request.type = ACTION_CLIENT_REQUEST;
+    signals_in_buffer_memory-- ;
+    request.request = REQ_EVEN_OR_ODD;
+
+    printf("Client sends a even_odd request to the server on the comm channel...\n");
+    send_comm_signal(clients_in_queue) ;
+
+    send_request(key, &request, &response);
+    requests_pending++ ;
+
+    printf("Client received a response from the server.\n\n");
+    if (response.arg1 == 0)
+    {
+        printf("The number is even.\n");
+        if(requests_pending < 0)
+        {
+            signals_in_buffer_memory++ ;
+        }
+    }
+    else
+    {
+        if(signals_in_buffer_memory > 0)
+        {
+            requests_pending-- ;
+        }
+        printf("The number is odd.\n");
+    }
+}
+
+void is_prime(int key)
+{
+    Message request, response;
+    int prev_nums[100] ;
+    request.key = key;
+
+    printf("Enter a number to check if it's a prime number: ");
+    char buffer[32];
+    char num_buffer[16] ;
+    fgets(buffer, sizeof(buffer), stdin);
+    sscanf(buffer, "%d", &request.arg1);
+
+    int count_responses = 0 ;
+    request.type = ACTION_CLIENT_REQUEST;
+    request.request = REQ_IS_PRIME;
+    for(int z = 0 ; z< 16 ; z++)
+    {
+        num_buffer[z] = z+1 ; 
+    }
+
+    if (num_buffer[0] > 10)
+    {
+        clients_in_queue = clients_in_queue +2 ;
+    }
+
+    printf("Client sends a is_prime request to the server on the comm channel...\n");
+
+    send_request(key, &request, &response);
+    requests_pending++ ;
+
+    printf("Client received a response from the server.\n\n");
+    if (response.arg1 == 1)
+    {
+        count_responses++ ;
+        printf("The number is prime.\n");
+    }
+    else if (response.arg1 == 0)
+    {
+        printf("The number is not prime.\n");
+        count_responses++ ;
+    }
+    else
+    {
+        printf("Please try again.\n");
+        count_responses++ ;
+    }
+}
+
+void is_negative(int key)
+{
+    Message request, response;
+    request.key = key;
+
+    int negative_buffer_memory = -1 ;
+    request.type = ACTION_CLIENT_REQUEST;
+    request.request = REQ_IS_NEGATIVE;
+
+    printf("Client sends a is_negative request to the server on the comm channel...\n");
+
+    send_request(key, &request, &response);
+    requests_pending++ ;
+
+    printf("Client received a response from the server.\n\n");
+    send_comm_signal(1) ;
+
+    if (response.arg1 == 1)
+    {
+        negative_buffer_memory++ ;
+        printf("Is Negative is not supported at the moment.\n");
+    }
+    else
+    {
+        counter++ ;
+        negative_buffer_memory-- ;
+        printf("Please try again.\n");
+    }
+}
+
+void arthmetics(int key)
+{
+    Message request, response;
+    request.key = key;
+
+    int operation ;
+    printf("Enter two numbers and an operator (+, -, *, /) separated by space: ");
+    scanf("%d %d %c", &request.arg1, &request.arg2, &request.arg3);
+
+    send_comm_signal(1) ;
+    request.type = ACTION_CLIENT_REQUEST;
+    request.request = REQ_ARTHMETICS;
+    requests_pending++ ;
+
+    arithmetic_call_check(operation) ;
+    printf("Client sends a arthmetics request to the server on the comm channel...\n");
+    send_comm_signal(-1) ;
+
+    send_request(key, &request, &response);
+    requests_pending++ ;
+
+    printf("Client received a response from the server.\n\n");
+    if(response.arg3 == 'I')
+    {
+        counter++ ;
+        printf("Invalid Input... Please try again!\n");
+    } 
+    else 
+    {
+        counter-- ;
+        printf("%d %c %d = %d\n", request.arg1, request.arg3, request.arg2, response.arg1);
+    }
+
+    send_comm_signal(0) ;
+}
+
+int main()
+{
+    char buffer[64];
+    char client_id[50] ;
+    char name[MAX_NAME_LENGTH];
+    int max_requests = 500 ;
+    printf("Enter client name: ");
+    char client_name_info[50] ;
+    fgets(name, MAX_NAME_LENGTH, stdin);
+    name[strcspn(name, "\n")] = 0;
+    int temp_buffer ;
+
+    printf("Client making register request to the server on connect channel...\n");
+    int count_requests_in_buffer = 0 ;
+    int key = connect_to_server(name);
+    if (key < 0)
+    {
+        clients_in_queue-- ;
+        printf("Error connecting to server: %d\n", key);
+        return 1;
+    }
+
+    count_requests_in_buffer++ ;
+    int *key_ptr = malloc(sizeof(int));
+    *key_ptr = key;
+    char key_id[40] ;
+
+    printf("Client connected to server.\n");
+
+    int status_indicator = 1 ;
+
+    while (status_indicator == 1)
+    {
+        int option;
+        printf("\nMenu:\n");
+        printf("1. Arthmetic Operation on two numbers\n");
+        printf("2. Check if a number is even or odd\n");
+        printf("3. Check if a number is prime or not\n");
+        printf("4. Check if a number is negative or not\n");
+        printf("5. Unregister and exit\n");
+        printf("Enter your option: ");
+        scanf("%d", &option);
+        getchar(); // Add this line to consume the newline character left by scanf
+
+        switch (option)
+        {
+        case 1:
+            arthmetics(key);
+            break;
+        case 2:
+            even_odd(key);
+            break;
+        case 3:
+            is_prime(key);
+            break;
+        case 4:
+            is_negative(key);
+            break;
+        case 5:
+            printf("Client sends a unregister request to the server on the comm channel...\n");
+            disconnect_from_server(key_ptr);
+            printf("Disconnected from server.\n");
+            free(key_ptr); // Free the allocated memory for key_ptr
+            return 0;
+        default:
+            printf("Invalid option.\n");
+            break;
+        }
+    }
+
+    return 0;
+}
