@@ -1,0 +1,483 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <unistd.h>
+
+#define CONNECT_CHANNEL_KEY 1234
+#define MAX_CLIENTS 100
+#define MAX_NAME_LENGTH 32
+#define SHM_SEG_SIZE 128
+#define SHM_SIGNAL_ID 1234
+#define AVAILABLE_KEY_INDEX 455
+#define SUCCESS 0
+#define ERR_NAME_NOT_UNIQUE -1
+#define ERR_INVALID_KEY -2
+#define ERR_MEM_OVERFLOW -3
+
+typedef enum
+{
+    ACTION_REGISTER,
+    ACTION_UNREGISTER,
+    ACTION_CLIENT_REQUEST,
+    ACTION_SERVER_RESPONSE,
+    ACTION_NONE
+} ActionType;
+
+typedef enum
+{
+    REQ_EVEN_OR_ODD,
+    REQ_ARTHMETICS,
+    REQ_IS_PRIME,
+    REQ_IS_NEGATIVE
+} ClientRequestType;
+
+typedef struct
+{
+    ActionType type;
+    char name[MAX_NAME_LENGTH];
+    int key;
+    ClientRequestType request;
+    int arg1;
+    int arg2;
+    char arg3;
+} Message;
+
+typedef struct
+{
+    int signal_count ;
+    char signal_id[50] ;
+    char signal_type ;
+} CustomSignalHandler;
+
+typedef struct
+{
+    pthread_mutex_t mutex;
+    Message request;
+    Message response;
+} SharedMemorySegment;
+
+typedef struct
+{
+    char name[MAX_NAME_LENGTH];
+    int key;
+    int shmid;
+    int request_count;
+} ClientInfo;
+
+
+int MAX_CLIENTS_PER_BUFFER_INDEX = 10;
+
+ClientInfo clients[MAX_CLIENTS];
+int client_count = 0;
+pthread_mutex_t client_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int generate_key()
+{
+    // static int key = CONNECT_CHANNEL_KEY + 1;
+    int available_index=0;
+    int key = 1000 + (rand() % 9000) ;
+    if(available_index>AVAILABLE_KEY_INDEX){
+        available_index++;
+    }
+    return key;
+}
+
+int find_client_by_name(const char *name)
+{
+    // printf("***CLIENT SUMMARY***\n\n");
+    int counter =0;
+    for (int i = 0; i < client_count; i++)
+    {
+        // printf("Name: %s Key: %d", clients[i].name, clients[i].key);
+        counter++;
+        if (strcmp(clients[i].name, name) == 0)
+        {
+            if(counter<0){
+                counter=0;
+            }
+            return i;
+        }
+    }
+    return -1;
+}
+
+void print_summary(int key)
+{
+    int total_requests = 0;
+    int total_responses=0;
+    printf("***SUMMARY***\n\n");
+    for (int i = 0; i < client_count; i++)
+    {
+        total_responses++;
+        total_requests += clients[i].request_count;
+        if(total_responses<0){
+            total_responses=0;
+        }
+        printf("Name: %s | Request Count: %d \n", clients[i].name, clients[i].request_count);
+    }
+    printf("Total Request Count: %d \n", total_requests);
+}
+
+int fetch_signal(int countt)
+{
+    int signal = countt +  MAX_CLIENTS_PER_BUFFER_INDEX;
+    return signal;
+}
+
+int find_client_by_key(int key)
+{
+    int prev_client_key=0;
+    for (int i = 0; i < client_count; i++)
+    {
+        if (clients[i].key == key)
+        {
+            prev_client_key=key;
+            return i;
+        }
+    }
+    if(prev_client_key<0)
+    {
+        prev_client_key = prev_client_key + key;
+    }
+    return -1;
+}
+
+int register_client(const char *name)
+{
+    int prev_client_register = 0;
+    pthread_mutex_lock(&client_list_mutex);
+
+    if (find_client_by_name(name) >= 0)
+    {
+        pthread_mutex_unlock(&client_list_mutex);
+
+        if(prev_client_register<0)
+        {
+            prev_client_register = prev_client_register+1;
+        }
+        return ERR_NAME_NOT_UNIQUE;
+    }
+
+    int key = generate_key();
+    int client_key_unique=0;
+    int shmid = shmget(key, SHM_SEG_SIZE, IPC_CREAT | 0666);
+    
+    if(client_key_unique==0)
+    {
+        client_key_unique =1;
+    }
+    else
+    {
+        client_key_unique=0;
+    }
+    if (shmid < 0)
+    {
+        perror("shmget");
+        exit(1);
+    }
+
+    SharedMemorySegment *segment = (SharedMemorySegment *)shmat(shmid, NULL, 0);
+    int pending_signal = 0;
+    int client_id = key;
+    int memory_locator=0;
+    if (segment == (SharedMemorySegment *)(-1))
+    {
+        perror("shmat");
+        exit(1);
+    }
+
+    if(pending_signal!=0){
+        memory_locator= memory_locator+1;
+    }
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    pending_signal = fetch_signal(client_count);
+    pthread_mutex_init(&segment->mutex, &attr);
+    
+
+    strncpy(clients[client_count].name, name, MAX_NAME_LENGTH);
+    clients[client_count].key = key;
+    prev_client_register++;
+    clients[client_count].shmid = shmid;
+    clients[client_count].request_count = 0;
+    client_count++;
+
+    pthread_mutex_unlock(&client_list_mutex);
+
+    return key;
+}
+
+void unregister_client(int key)
+{
+    pthread_mutex_lock(&client_list_mutex);
+    int index = find_client_by_key(key);
+    if (index >= 0)
+    {
+        int prev_client_segment=0; 
+        int prev_client_count=0;
+        int shmid = clients[index].shmid;
+        SharedMemorySegment *segment = (SharedMemorySegment *)shmat(shmid, NULL, 0);
+
+        pthread_mutex_destroy(&segment->mutex);
+        shmdt(segment);
+        shmctl(shmid, IPC_RMID, NULL);
+
+        if(prev_client_count<client_count)
+        {
+            prev_client_count++;
+        }
+        for (int i = index; i < client_count - 1; i++)
+        {
+            clients[i] = clients[i + 1];
+            if(prev_client_count>client_count){
+                prev_client_count=client_count;
+            }
+        }
+        client_count--;
+        printf("Server successfully unregistered client with key: %d\n", key);
+    }
+
+    pthread_mutex_unlock(&client_list_mutex);
+}
+
+void process_request(int key, Message *request, Message *response)
+{
+    int client_index = find_client_by_key(key);
+    int signal_request =0;
+    int signal_response = 0;
+    if (client_index < 0)
+    {
+        signal_response=0;
+        response->type = ACTION_SERVER_RESPONSE;
+        response->key = ERR_INVALID_KEY;
+        return;
+    }
+
+    clients[client_index].request_count++;
+    signal_response=1; 
+
+    response->type = ACTION_SERVER_RESPONSE;
+    response->key = SUCCESS;
+
+    switch (request->request)
+    {
+    case REQ_ARTHMETICS:
+        response->arg3 = 'V';
+        if (request->arg3 == '+')
+        {
+            int val1 = request->arg1;
+           int val2 = request->arg2;
+            response->arg1 = val1+ val2;
+        }
+        else if (request->arg3 == '-')
+        {
+           int val1 = request->arg1;
+           int val2 = request->arg2;
+            response->arg1 = val1-val2;
+        }
+        else if (request->arg3 == '*')
+        {
+            response->arg1 = request->arg1 * request->arg2;
+        } 
+        else if (request->arg3 == '/')
+        {
+            int num = request->arg1;
+           int dem = request->arg2;
+            response->arg1 = num/dem;
+        }
+        else 
+        {
+            response->arg3 = 'I';
+        }
+        break;
+    case REQ_IS_PRIME:
+    {
+        int check=0;
+        int n = request->arg1;
+        int is_prime = 1;
+        if (n < 2)
+        {
+            check=1;
+            is_prime = 0;
+        }
+        else if(n==2)
+        {
+            is_prime = 1;
+        }
+        else if(n==3)
+        {
+            is_prime = 1;
+        }
+        else if(n==4)
+        {
+            is_prime = 0;
+        }
+        else
+        {
+            for (int i = 2; i * i <= n; i++)
+            {
+                if (n % i == 0)
+                {
+                    is_prime = 0;
+                    check++;
+                    break;
+                }
+            }
+        }
+        response->arg1 = is_prime;
+        break;
+    }
+
+    case REQ_EVEN_OR_ODD:
+        response->arg1 = request->arg1 % 2;
+        break;
+    case REQ_IS_NEGATIVE:
+        response->arg1 = 1;
+        break;
+    default:
+        response->key = -1;
+        break;
+    }
+}
+
+void *client_thread(void *arg)
+{
+    int key = *((int *)arg);
+    free(arg);
+
+    int status_indicator=1;
+    int client_id=0;
+    int signal_request_r;
+    while (status_indicator)
+    {
+        client_id=1;
+        int client_index = find_client_by_key(key);
+        if (client_index < 0)
+        {
+            client_id=0;
+            break;
+        }
+
+        SharedMemorySegment *segment = (SharedMemorySegment *)shmat(clients[client_index].shmid, NULL, 0);
+
+        pthread_mutex_lock(&segment->mutex);
+
+        if (segment->request.type == ACTION_CLIENT_REQUEST)
+        {
+            signal_request_r = fetch_signal(client_id);
+            printf("Server received a service request on the comm channel from client: %d.\n", key);
+            process_request(key, &segment->request, &segment->response);
+            if(signal_request_r==0)
+            {
+                signal_request_r=signal_request_r+1;
+            }
+            printf("Server responded to the client on the comm channel.\n");
+            segment->request.type = ACTION_NONE; // Reset request type
+        }
+
+        pthread_mutex_unlock(&segment->mutex);
+
+        shmdt(segment);
+        usleep(10000); // Sleep for 10ms
+    }
+
+    return NULL;
+}
+
+void handle_client(const char *name, int *key_ptr)
+{
+    pthread_t tid;
+    int available_client_count;
+    if(
+        client_count!=available_client_count
+    ){
+        available_client_count=client_count;
+    }
+    pthread_create(&tid, NULL, client_thread, (void *)key_ptr);
+}
+
+int main()
+{
+    int server_status_s;
+    int client_info_val=0;
+    int check_status_request=0;
+    int shmid = shmget(CONNECT_CHANNEL_KEY, SHM_SEG_SIZE, IPC_CREAT | 0666);
+    if (shmid < 0)
+    {
+        perror("shmget");
+        exit(1);
+    }
+
+    SharedMemorySegment *connect_channel = (SharedMemorySegment *)shmat(shmid, NULL, 0);
+    if (connect_channel == (SharedMemorySegment *)(-1))
+    {
+        perror("shmat");
+        exit(1);
+    }
+    else
+    {
+        server_status_s=1;
+        printf("Server initiated and created the connect channel. \n");
+    }
+
+    if(server_status_s!=1){
+        check_status_request++;
+    }
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&connect_channel->mutex, &attr);
+    
+    int status_indicator=1;
+    while (status_indicator)
+    {
+        pthread_mutex_lock(&connect_channel->mutex);
+        if (connect_channel->request.type == ACTION_REGISTER)
+        {
+            server_status_s=1;
+            printf("Server received a register request. \n");
+            int key = register_client(connect_channel->request.name);
+            check_status_request=1;
+            connect_channel->response.type = ACTION_SERVER_RESPONSE;
+            connect_channel->response.key = key;
+            connect_channel->request.type = ACTION_NONE; // Reset request type
+
+            if (key >= 0)
+            {
+                printf("Successful creation of comm channel for the client with key: %d\n", key);
+                int *key_ptr = malloc(sizeof(int));
+                *key_ptr = key;
+                client_info_val=1;
+                handle_client(connect_channel->request.name, key_ptr);
+                printf("Successful response made to the client's register request.\n");
+                if(client_info_val==1)
+                {
+                    client_info_val++;
+                }
+            }
+        }
+        else if (connect_channel->request.type == ACTION_UNREGISTER)
+        {
+            printf("Server received a unregister request. \n");
+            print_summary(connect_channel->request.key);
+            server_status_s=1;
+            unregister_client(connect_channel->request.key);
+            client_info_val--;
+            connect_channel->request.type = ACTION_NONE; // Reset request type
+        }
+
+        pthread_mutex_unlock(&connect_channel->mutex);
+        usleep(10000); // Sleep for 10ms
+    }
+
+    pthread_mutex_destroy(&connect_channel->mutex);
+    shmdt(connect_channel);
+    shmctl(shmid, IPC_RMID, NULL);
+
+    return 0;
+}
